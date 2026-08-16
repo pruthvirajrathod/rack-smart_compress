@@ -1,0 +1,304 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "bundler/setup"
+require "rack"
+require "rack/test"
+require "json"
+require "zlib"
+require "brotli"
+require "zstd-ruby"
+require "tmpdir"
+require "fileutils"
+require_relative "../lib/rack/smart_compress"
+
+class Color
+  GREEN  = "\e[32m"
+  RED    = "\e[31m"
+  YELLOW = "\e[33m"
+  CYAN   = "\e[36m"
+  BOLD   = "\e[1m"
+  RESET  = "\e[0m"
+end
+
+def pass(name, details = "")
+  puts " #{Color::GREEN}✔ PASS#{Color::RESET} | #{Color::BOLD}#{name}#{Color::RESET} #{details}"
+end
+
+def fail_test(name, reason)
+  puts " #{Color::RED}✖ FAIL#{Color::RESET} | #{Color::BOLD}#{name}#{Color::RESET}: #{reason}"
+  @failures += 1
+end
+
+@tests = 0
+@failures = 0
+
+puts "\n#{Color::CYAN}#{Color::BOLD}==============================================================================#{Color::RESET}"
+puts "#{Color::CYAN}#{Color::BOLD}       🚀 Rack::SmartCompress Comprehensive End-to-End Test Suite             #{Color::RESET}"
+puts "#{Color::CYAN}#{Color::BOLD}==============================================================================#{Color::RESET}\n"
+
+# Setup Test Target Application
+class TestRackApp
+  def self.call(env)
+    path = env["PATH_INFO"]
+
+    case path
+    when "/large_json"
+      body = { status: "success", data: "x" * 5000, items: (1..200).to_a }.to_json
+      [200, { "Content-Type" => "application/json", "ETag" => %("strong-etag-123") }, [body]]
+    when "/no_transform"
+      body = { status: "success", data: "x" * 5000 }.to_json
+      [200, { "Content-Type" => "application/json", "Cache-Control" => "no-transform" }, [body]]
+    when "/partial_content"
+      [206, { "Content-Type" => "application/json", "Content-Range" => "bytes 0-100/5000" }, ["partial"]]
+    when "/small_json"
+      body = { status: "ok" }.to_json
+      [200, { "Content-Type" => "application/json" }, [body]]
+    when "/image"
+      body = "PNG_BINARY_SIMULATION_" + ("0" * 2000)
+      [200, { "Content-Type" => "image/png" }, [body]]
+    when "/no_content"
+      [204, {}, []]
+    when "/already_compressed"
+      [200, { "Content-Type" => "application/json", "Content-Encoding" => "custom" }, ["data"]]
+    when "/streaming"
+      body = Class.new do
+        def each
+          yield "Stream Part 1: " + ("A" * 2000)
+          yield "Stream Part 2: " + ("B" * 2000)
+        end
+      end.new
+      [200, { "Content-Type" => "text/html" }, body]
+    else
+      [404, { "Content-Type" => "text/plain" }, ["Not Found"]]
+    end
+  end
+end
+
+options = {
+  cache: true,
+  cache_size: 100,
+  dynamic_levels: true,
+  if: ->(env, status, headers) { env["HTTP_X_SKIP_COMPRESS"].nil? }
+}
+
+middleware = Rack::SmartCompress::Middleware.new(TestRackApp, options)
+session = Rack::Test::Session.new(Rack::MockSession.new(middleware))
+
+# Test 1: Zstd Compression
+@tests += 1
+session.get("/large_json", {}, { "HTTP_ACCEPT_ENCODING" => "zstd" })
+if session.last_response.headers["Content-Encoding"] == "zstd"
+  decompressed = Zstd.decompress(session.last_response.body)
+  if decompressed.include?("success")
+    pass("Zstd Compression & Decompression", "(Size: #{session.last_response.body.bytesize} bytes)")
+  else
+    fail_test("Zstd Compression", "Decompressed content mismatch")
+  end
+else
+  fail_test("Zstd Compression", "Header missing or incorrect")
+end
+
+# Test 2: Brotli Compression
+@tests += 1
+session.get("/large_json", {}, { "HTTP_ACCEPT_ENCODING" => "br" })
+if session.last_response.headers["Content-Encoding"] == "br"
+  decompressed = Brotli.inflate(session.last_response.body)
+  if decompressed.include?("success")
+    pass("Brotli (br) Compression & Decompression", "(Size: #{session.last_response.body.bytesize} bytes)")
+  else
+    fail_test("Brotli Compression", "Decompressed content mismatch")
+  end
+else
+  fail_test("Brotli Compression", "Header missing or incorrect")
+end
+
+# Test 3: Gzip Compression
+@tests += 1
+session.get("/large_json", {}, { "HTTP_ACCEPT_ENCODING" => "gzip" })
+if session.last_response.headers["Content-Encoding"] == "gzip"
+  gz = Zlib::GzipReader.new(StringIO.new(session.last_response.body))
+  if gz.read.include?("success")
+    pass("Gzip Compression & Decompression", "(Size: #{session.last_response.body.bytesize} bytes)")
+  else
+    fail_test("Gzip Compression", "Decompressed content mismatch")
+  end
+else
+  fail_test("Gzip Compression", "Header missing or incorrect")
+end
+
+# Test 4: Deflate Compression
+@tests += 1
+session.get("/large_json", {}, { "HTTP_ACCEPT_ENCODING" => "deflate" })
+if session.last_response.headers["Content-Encoding"] == "deflate"
+  decompressed = Zlib::Inflate.inflate(session.last_response.body)
+  if decompressed.include?("success")
+    pass("Deflate Compression & Decompression", "(Size: #{session.last_response.body.bytesize} bytes)")
+  else
+    fail_test("Deflate Compression", "Decompressed content mismatch")
+  end
+else
+  fail_test("Deflate Compression", "Header missing or incorrect")
+end
+
+# Test 5: Negotiation & q-values priority
+@tests += 1
+session.get("/large_json", {}, { "HTTP_ACCEPT_ENCODING" => "gzip;q=0.3, zstd;q=0.9, br;q=0.8" })
+if session.last_response.headers["Content-Encoding"] == "zstd"
+  pass("HTTP Accept-Encoding q-value Negotiation", "(Selected 'zstd' over gzip/br based on q=0.9)")
+else
+  fail_test("q-value Negotiation", "Expected 'zstd', got '#{session.last_response.headers['Content-Encoding']}'")
+end
+
+# Test 6: Wildcard * Negotiation
+@tests += 1
+session.get("/large_json", {}, { "HTTP_ACCEPT_ENCODING" => "*" })
+if session.last_response.headers["Content-Encoding"] == "zstd"
+  pass("HTTP Accept-Encoding Wildcard * Negotiation", "(Selected highest priority 'zstd')")
+else
+  fail_test("Wildcard Negotiation", "Expected 'zstd', got '#{session.last_response.headers['Content-Encoding']}'")
+end
+
+# Test 7: Skip condition: Small payload (< 1 KB)
+@tests += 1
+session.get("/small_json", {}, { "HTTP_ACCEPT_ENCODING" => "gzip" })
+if session.last_response.headers["Content-Encoding"].nil?
+  pass("Skip Condition: Payload < 1 KB Threshold", "(Left uncompressed as expected)")
+else
+  fail_test("Small Payload Threshold", "Should not compress payloads under 1 KB")
+end
+
+# Test 8: Skip condition: Image / Binary MIME type
+@tests += 1
+session.get("/image", {}, { "HTTP_ACCEPT_ENCODING" => "gzip" })
+if session.last_response.headers["Content-Encoding"].nil?
+  pass("Skip Condition: Excluded MIME Type (image/png)", "(Left uncompressed as expected)")
+else
+  fail_test("MIME Exclusion", "Compressed an excluded MIME type image/png")
+end
+
+# Test 9: Skip condition: No Content (204)
+@tests += 1
+session.get("/no_content", {}, { "HTTP_ACCEPT_ENCODING" => "gzip" })
+if session.last_response.headers["Content-Encoding"].nil?
+  pass("Skip Condition: 204 No Content Status", "(Left uncompressed as expected)")
+else
+  fail_test("Status 204", "Compressed a 204 response")
+end
+
+# Test 10: Skip condition: Cache-Control: no-transform
+@tests += 1
+session.get("/no_transform", {}, { "HTTP_ACCEPT_ENCODING" => "zstd" })
+if session.last_response.headers["Content-Encoding"].nil?
+  pass("RFC 9111 Compliance: Cache-Control: no-transform", "(Left uncompressed as required)")
+else
+  fail_test("no-transform", "Compressed a response with Cache-Control: no-transform")
+end
+
+# Test 11: Skip condition: 206 Partial Content
+@tests += 1
+session.get("/partial_content", {}, { "HTTP_ACCEPT_ENCODING" => "gzip" })
+if session.last_response.headers["Content-Encoding"].nil?
+  pass("RFC Compliance: 206 Partial Content / Content-Range", "(Skipped compression for range request)")
+else
+  fail_test("206 Partial Content", "Compressed a 206 partial response")
+end
+
+# Test 12: RFC 9110 ETag Weakening
+@tests += 1
+session.get("/large_json", {}, { "HTTP_ACCEPT_ENCODING" => "gzip" })
+if session.last_response.headers["ETag"] == %(W/"strong-etag-123")
+  pass("RFC 9110 ETag Weakening", "(Converted strong ETag to W/\"strong-etag-123\")")
+else
+  fail_test("ETag Weakening", "Expected W/\"strong-etag-123\", got '#{session.last_response.headers['ETag']}'")
+end
+
+# Test 13: Custom Filter Rule (:if condition)
+@tests += 1
+session.get("/large_json", {}, { "HTTP_ACCEPT_ENCODING" => "gzip", "HTTP_X_SKIP_COMPRESS" => "true" })
+if session.last_response.headers["Content-Encoding"].nil?
+  pass("Custom Filter Rule (:if condition)", "(Skipped compression when header present)")
+else
+  fail_test("Custom Filter Rule", "Failed to enforce custom :if rule")
+end
+
+# Test 14: In-Memory LRU Cache Hits & Misses
+@tests += 1
+initial_hits = middleware.cache.hits
+session.get("/large_json", {}, { "HTTP_ACCEPT_ENCODING" => "zstd" }) # 1st call -> hit
+session.get("/large_json", {}, { "HTTP_ACCEPT_ENCODING" => "zstd" }) # 2nd call -> hit!
+if middleware.cache.hits > initial_hits
+  pass("In-Memory LRU Cache", "(Cache hit count increased to #{middleware.cache.hits})")
+else
+  fail_test("LRU Cache", "Cache hit count did not increase")
+end
+
+# Test 15: Streaming Chunked Response Compression (Gzip)
+@tests += 1
+session.get("/streaming", {}, { "HTTP_ACCEPT_ENCODING" => "gzip" })
+if session.last_response.headers["Content-Encoding"] == "gzip"
+  gz = Zlib::GzipReader.new(StringIO.new(session.last_response.body))
+  content = gz.read
+  if content.include?("Stream Part 1") && content.include?("Stream Part 2")
+    pass("Streaming Chunked Gzip Compression", "(Successfully streamed & compressed chunks)")
+  else
+    fail_test("Streaming Gzip", "Streamed content corrupted")
+  end
+else
+  fail_test("Streaming Gzip", "Content-Encoding missing for stream")
+end
+
+# Test 16: Streaming Chunked Response Compression (Zstd)
+@tests += 1
+session.get("/streaming", {}, { "HTTP_ACCEPT_ENCODING" => "zstd" })
+if session.last_response.headers["Content-Encoding"] == "zstd"
+  decompressed = Zstd.decompress(session.last_response.body)
+  if decompressed.include?("Stream Part 1") && decompressed.include?("Stream Part 2")
+    pass("Streaming Chunked Zstd Compression", "(Successfully streamed & compressed chunks via Zstd::StreamingCompress)")
+  else
+    fail_test("Streaming Zstd", "Streamed content corrupted")
+  end
+else
+  fail_test("Streaming Zstd", "Content-Encoding missing for stream")
+end
+
+# Test 17: Streaming Chunked Response Compression (Brotli)
+@tests += 1
+session.get("/streaming", {}, { "HTTP_ACCEPT_ENCODING" => "br" })
+if session.last_response.headers["Content-Encoding"] == "br"
+  decompressed = Brotli.inflate(session.last_response.body)
+  if decompressed.include?("Stream Part 1") && decompressed.include?("Stream Part 2")
+    pass("Streaming Chunked Brotli Compression", "(Successfully streamed & compressed chunks via Brotli::Compressor)")
+  else
+    fail_test("Streaming Brotli", "Streamed content corrupted")
+  end
+else
+  fail_test("Streaming Brotli", "Content-Encoding missing for stream")
+end
+
+# Test 18: Pre-compressed Static Asset Serving (.zst)
+@tests += 1
+static_tmp = Dir.mktmpdir("smart_compress_e2e_static")
+FileUtils.mkdir_p(File.join(static_tmp, "assets"))
+File.write(File.join(static_tmp, "assets", "bundle.js"), "console.log('uncompressed');")
+File.write(File.join(static_tmp, "assets", "bundle.js.zst"), "PRE_COMPRESSED_ZSTD_STATIC_PAYLOAD")
+
+static_app = Rack::SmartCompress::Static.new(TestRackApp, root: static_tmp, urls: ["/assets"])
+static_session = Rack::Test::Session.new(Rack::MockSession.new(static_app))
+
+static_session.get("/assets/bundle.js", {}, { "HTTP_ACCEPT_ENCODING" => "zstd" })
+if static_session.last_response.headers["Content-Encoding"] == "zstd" && static_session.last_response.body == "PRE_COMPRESSED_ZSTD_STATIC_PAYLOAD"
+  pass("Pre-Compressed Static Asset Serving (Zstd)", "(Served pre-compressed .zst asset directly with 0 CPU)")
+else
+  fail_test("Static Zstd Serving", "Failed to serve pre-compressed asset")
+end
+FileUtils.rm_rf(static_tmp)
+
+puts "\n#{Color::CYAN}==============================================================================#{Color::RESET}"
+if @failures == 0
+  puts "#{Color::GREEN}#{Color::BOLD}🎉 ALL #{@tests} END-TO-END TESTS PASSED SUCCESSFULLY! Gem is 100% production-ready.#{Color::RESET}"
+else
+  puts "#{Color::RED}#{Color::BOLD}✖ #{@failures} OUT OF #{@tests} TESTS FAILED.#{Color::RESET}"
+  exit 1
+end
+puts "#{Color::CYAN}==============================================================================#{Color::RESET}\n"

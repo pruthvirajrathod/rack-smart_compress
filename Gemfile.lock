@@ -1,0 +1,45 @@
+PATH
+  remote: .
+  specs:
+    rack-smart_compress (0.1.0)
+      rack (>= 2.0.0)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    brotli (0.8.0)
+    diff-lcs (1.6.2)
+    rack (3.2.6)
+    rack-test (2.2.0)
+      rack (>= 1.3)
+    rake (13.4.2)
+    rspec (3.13.2)
+      rspec-core (~> 3.13.0)
+      rspec-expectations (~> 3.13.0)
+      rspec-mocks (~> 3.13.0)
+    rspec-core (3.13.6)
+      rspec-support (~> 3.13.0)
+    rspec-expectations (3.13.5)
+      diff-lcs (>= 1.2.0, < 2.0)
+      rspec-support (~> 3.13.0)
+    rspec-mocks (3.13.8)
+      diff-lcs (>= 1.2.0, < 2.0)
+      rspec-support (~> 3.13.0)
+    rspec-support (3.13.7)
+    zstd-ruby (1.5.7.1)
+
+PLATFORMS
+  aarch64-linux
+  ruby
+
+DEPENDENCIES
+  brotli (~> 0.4)
+  bundler (>= 2.0)
+  rack-smart_compress!
+  rack-test (~> 2.1)
+  rake (~> 13.0)
+  rspec (~> 3.12)
+  zstd-ruby (~> 1.5)
+
+BUNDLED WITH
+   2.5.22
